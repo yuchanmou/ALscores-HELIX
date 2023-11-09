@@ -1,0 +1,239 @@
+---
+title: "Dataset prep: Air pollution, noise level and allostatic load"
+author: "Yuchan Mou"
+date: "2023-09-08"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load pkgs
+```{r load packages, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# load pkgs
+packages <- c("dplyr", "tidyverse", "readxl", "openxlsx", "ggplot2", "Biobase", "Hmisc", "labelled")
+sapply(packages, library, character.only = T)
+```
+
+# Import data
+```{r import data}
+df <- read_excel("/Users/ymou/helix_project/data/HELIX_AP_132_request_updated19sep.2023.xlsx")
+# proteome data
+load("/Users/ymou/helix_project/data/proteome_subcohort_v5.Rdata")
+# steriod data
+dt <- read_csv("/Users/ymou/helix_project/data/cortisol/Final corticosteroid data/Helix_urine_corticosteroid_profile_processed.csv", locale=locale(encoding="latin1"))
+
+```
+
+# Steriod data manipulation
+Unnormalized concentrations (ng/mL)
+
+```{r steriod data}
+dt <- dt %>% rename(HelixID = Sample) # 1006 obs
+# check duplicate
+dt[duplicated(dt$HelixID), ]
+```
+
+# Proteome dataset
+```{r proteome dataset feature}
+# ExpressionSetIntroduction
+# https://www.bioconductor.org/packages/devel/bioc/vignettes/Biobase/inst/doc/ExpressionSetIntroduction.pdf
+
+proteome_subcohort
+# 36 protein/features, 1188 samples. unit pg/ml
+
+# extract assay data
+dt_protassay <- exprs(proteome_subcohort)
+class(dt_protassay)
+dim(dt_protassay)
+colnames(dt_protassay)
+
+dt_prot <- as.data.frame(t(dt_protassay))
+dt_prot$SampleID <- row.names.data.frame(dt_prot)
+dt_prot <- dt_prot %>% relocate(SampleID, .before = Adiponectin)
+
+# extract annotated data
+dt_annot <- phenoData(proteome_subcohort)
+dt_assaypheno <- dt_annot@data
+
+# merge assay data and annotated data
+df_prot <- full_join(dt_assaypheno, dt_prot, by = "SampleID")
+```
+
+# General daatset
+```{r general dataset feature}
+# basic info
+dim(df) # 1301 participants, 127 vars
+varname <- as_tibble(tbl_vars(df))
+
+# set null, unable to complete (pulse) into NA
+df <- df %>% mutate(across(where(is.character), ~ na_if(., "null")))
+df <- df %>% mutate(across(where(is.character), ~ na_if(., "unable to complete")))
+df <- df %>% mutate(across(where(is_logical), as.numeric))
+
+df <- df %>%
+  mutate_at(c("hs_bp_pulse1", "hs_bp_pulse2", "hs_bp_pulse3"), as.numeric) %>%
+  mutate(bp_pulse_avg = (hs_bp_pulse2 + hs_bp_pulse3) / 2,
+         hs_non_hdl_c = hs_totchol_c - hs_hdlchol_c)
+```
+
+# Merge datasets
+```{r final dataset merge}
+# steriod data
+dt_final <- dt
+dt_final2 <- dt %>%
+  select(-"cohort")
+
+# merge general dataset, proteome and steriod datasets together
+df_full <- df %>%
+  left_join(df_prot, by = "HelixID", keep = FALSE, unmatched = "drop") %>%
+  left_join(dt_final2, by = "HelixID", keep = FALSE) %>%
+  rename_at(
+    vars(ends_with(".x")),
+    ~ str_replace(., "\\..$", "")
+  ) %>%
+  select_at(
+    vars(-ends_with(".y"))
+  )
+```
+
+# Data Manipulation
+## Unit conversion
+```{r unit conversion}
+# lipids unit conversion
+# original unit is mmol/L. Converted to mg/L
+# hdl, ldl, totchol
+chol_conv <- function(x) {
+  x * 38.67
+}
+df_full <- df_full %>%
+  mutate_at(
+    c("hs_hdlchol_c", "hs_ldlchol_c", "hs_totchol_c", "hs_non_hdl_c"), ~ chol_conv(.)
+  )
+
+# triglycerides
+triglyc_conv <- function(x) {
+  x * 88.57
+}
+df_full <- df_full %>%
+  mutate_at("hs_triglyc_c", ~ triglyc_conv(.))
+
+# inflammatory biomarkers
+# DO NOT RUN: the data has been log2 transformed, imputed and normalized
+# orginal unit is pg/mL. Converted to mg/L
+# inflam_conv <- function(x){x*(1e-6)}
+# df_full <- df_full %>%
+# mutate_at(
+# c("CRP", "IL1beta", "IL6", "IL8", "IL10", "TNFalfa"), ~ inflam_conv(.))
+
+```
+
+## Cortisol data manipulation
+```{r}
+df_full <- df_full %>% 
+  rename(cortisol_prod = Cort_Prod,
+         cortisol_metab = Cort_metab)
+hist(df_full$cortisol_prod)
+hist(df_full$cortisol_metab)
+
+# log 10 transformation
+df_full$cortisol_prod_log10 <- log10(df_full$cortisol_prod)
+hist(df_full$cortisol_prod_log10)
+mean(df_full$cortisol_prod_log10, na.rm = T)
+sd(df_full$cortisol_prod_log10, na.rm = T)
+
+df_full$cortisol_metab_log10 <- log10(df_full$cortisol_metab)
+hist(df_full$cortisol_metab_log10)
+mean(df_full$cortisol_metab_log10, na.rm = T)
+sd(df_full$cortisol_metab_log10, na.rm = T)
+```
+
+## Add value labels
+```{r add value labels}
+df_full$e3_asmokyn_p <- if_else(df_full$e3_asmokyn_p == "no", 0, 1, NA)
+df_full$e3_sex <- if_else(df_full$e3_sex == "male", 1, 0, NA)
+
+df_full <- df_full %>% mutate_at(c("hs_lden_c_h", "hs_lden_c_s"), as.numeric)
+
+df_full <- df_full %>% set_value_labels(
+  FAS_cat = c(Low = 1, Middle = 2, High = 3),
+  h_native = c("None native" = 0, "One native" = 1, "Both native" = 2),
+  h_edumc = c(Low = 1, Middle = 2, High = 3),
+  h_edufc = c(Low = 1, Middle = 2, High = 3),
+  e3_sex = c(Boys = 1, Girls = 0),
+  hs_smk_parents = c(Neither = 1, One = 2, Both = 3),
+  hs_globalexp = c(No = 1, Outside = 2, Inside = 3, "In and outside house" = 4),
+  e3_asmokyn_p = c(No = 0, Yes = 1),
+  e3_alcpreg_yn = c(No = 0, Yes = 1),
+  h_marital = c("Living alone" = 1, "Living with the father" = 2, "Other situation" = 3),
+  h_parity = c("No child" = 0, "One child" = 1, ">=2 children" = 2),
+  # lden labels
+  # 1: <55; 2:55-59.9; 3: 60-64.9; 4: 65-69.9; 5: 70-74.9; 6: >75 dB(A)
+  hs_lden_c_h = c("<55" = 1, "55-59.9" = 2, "60-64.9" = 3, "65-69.9" = 4, "70-74.9" = 5, ">75" = 6),
+  hs_lden_c_s = c("<55" = 1, "55-59.9" = 2, "60-64.9" = 3, "65-69.9" = 4, "70-74.9" = 5, ">75" = 6)
+)
+```
+
+## Change variable class
+```{r var class conversion}
+df_full <- df_full %>% mutate_at(c(
+  "e3_sex", "cohort",
+  "FAS_cat", "h_native", "h_ethnicity_c", "h_ethnicity_3cat", "h_ethnicity_cauc", "h_edumc", "h_edufc",
+  "hs_smk_parents", "hs_globalexp", "e3_asmokyn_p", "e3_alcpreg_yn", "h_marital", "h_parity",
+  "hs_lden_c_h", "hs_lden_c_s"
+), as_factor)
+
+df_full <- df_full %>% mutate_at(c(
+  "hs_no2_dy_hs_t", "hs_no2_wk_hs_t", "hs_no2_yr_hs_t", "hs_no2_yr_hs_h", "hs_no2_yr_hs_s", "hs_no2_yr_hs_r", "hs_no2_yr_hs_p",
+  "hs_pm25_dy_hs_t", "hs_pm25_wk_hs_t", "hs_pm25_yr_hs_t", "hs_pm25_yr_hs_h", "hs_pm25_yr_hs_s", "hs_pm25_yr_hs_r", "hs_pm25_yr_hs_p",
+  "hs_pm25abs_dy_hs_t", "hs_pm25abs_wk_hs_t", "hs_pm25abs_yr_hs_t", "hs_pm25abs_yr_hs_h", "hs_pm25abs_yr_hs_s", "hs_pm25abs_yr_hs_r", "hs_pm25abs_yr_hs_p",
+  "hs_pm10_dy_hs_t", "hs_pm10_wk_hs_t", "hs_pm10_yr_hs_t", "hs_pm10_yr_hs_h", "hs_pm10_yr_hs_s", "hs_pm10_yr_hs_r", "hs_pm10_yr_hs_p",
+  "hs_lden_h", "hs_lden_s",
+  "hs_lden_p", "hs_lden_r", "hs_lden_t",
+  "FAS_score",
+  "hs_mvpa", "hs_sd_wk",
+  "h_age", "hs_child_age_years",
+  "cortisol_prod", "cortisol_prod_log10",
+  "cortisol_metab", "cortisol_metab_log10",
+  "hs_bp_pulse1", "hs_bp_pulse2", "hs_bp_pulse3", "bp_pulse_avg"
+), as.numeric)
+
+df_full$h_cbirth <- as.Date(df_full$h_cbirth)
+
+df_full$child_age_grp <- cut(df_full$hs_child_age_years,
+  breaks = c(5, 6, 7, 8, 9, 10, 11, 12.1),
+  labels = c("5-5.9", "6-6.9", "7-7.9", "8-8.9", "9-9.9", "10-10.9", "11+")
+) # greater than or equal to the cutpoint
+```
+
+## Standardize pulse rate by age and sex
+```{r}
+library(modelr)
+
+pulse <- glm(data=df_full, formula = bp_pulse_avg ~ e3_sex + hs_child_age_years, family = gaussian)
+int <- pulse$coefficients[1]
+coef_sex <- pulse$coefficients[2]
+coef_age <- pulse$coefficients[3]
+
+df_full <- df_full %>% add_residuals(pulse)
+df_full$bp_pulse_sd0 <- int + df_full$resid
+df_full$bp_pulse_sd <- as.numeric(scale(df_full$bp_pulse_sd0, center = TRUE, scale = TRUE))
+```
+
+# Dataset stratified by sex
+```{r}
+df_g <- df_full %>% filter(e3_sex == "Girls")
+df_b <- df_full %>% filter(e3_sex == "Boys")
+```
+
+```{r export dataset}
+save(df_full, df_g, df_b, dt_final, file = "/Users/ymou/helix_project/data/analysis_data/df_full.RData")
+```
+
+```{r output, include=FALSE, eval=F}
+# convert rmd to r file
+knitr::purl("1_dataset_prep.Rmd", documentation = 1L)
+```

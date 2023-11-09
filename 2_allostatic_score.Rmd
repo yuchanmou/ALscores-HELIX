@@ -1,0 +1,898 @@
+---
+title: "Allostatic load score construction"
+author: "Yuchan Mou"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r env_setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+options(knitr.table.format = "html")
+```
+
+
+```{r load packages, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# load pkgs
+packages <- c("rlang", "dplyr", "tidyverse", "readxl", "openxlsx", "ggplot2", "gtools", "kableExtra", "scales")
+sapply(packages, library, character.only = T)
+```
+
+```{r import data2, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+load("/Users/ymou/helix_project/data/analysis_data/df_full.RData")
+```
+
+```{r define biomarkers, include=FALSE, echo=FALSE, message=FALSE, warning=FALSE}
+# 19 biomarkers included in the main AL score
+# hs_non_hdl_c is calculated with hs_totchol_c - hs_hdlchol_c
+biomarker_all <- c(
+  "hs_zsys_bp", "hs_zdia_bp", "bp_pulse_sd",
+  "hs_zbmi_who", "hs_zwaist_mets", "hs_skf_sum2", "hs_fatprop_bia",
+  "hs_hdlchol_c", "hs_non_hdl_c", "hs_triglyc_c", "Leptin",
+  "Adiponectin",
+  "CRP", "IL1beta", "IL6", "IL8", "IL10", "TNFalfa",
+  "cortisol_prod_log10"
+)
+
+biomarker_positivescore <- c(
+  "hs_zsys_bp", "hs_zdia_bp", "bp_pulse_sd",
+  "hs_zbmi_who", "hs_zwaist_mets", "hs_skf_sum2", "hs_fatprop_bia",
+  "hs_non_hdl_c", "hs_triglyc_c", "Leptin",
+  "CRP", "IL1beta", "IL6", "IL8", "TNFalfa"
+)
+biomarker_reversescore <- c(
+  "hs_hdlchol_c", "Adiponectin", "IL10"
+)
+biomarker_nonlinearscore <- c("cortisol_prod_log10")
+
+# 4 physiological systems
+physystems <- c("cardio", "metab", "immune", "neuro")
+
+cardio <- c("hs_zsys_bp", "hs_zdia_bp", "bp_pulse_sd") # 3 biomarkers
+metab <- c(
+  "hs_zbmi_who", "hs_zwaist_mets", "hs_skf_sum2", "hs_fatprop_bia",
+  "hs_hdlchol_c", "hs_non_hdl_c", "hs_triglyc_c", "Leptin", "Adiponectin"
+) # 9 biomarkers
+immune <- c("CRP", "IL1beta", "IL6", "IL8", "IL10", "TNFalfa") # 6 biomarkers
+neuro <- c("cortisol_prod_log10") # 1 biomarkers
+```
+
+```{r descriptive statistic func}
+#' @description Function to automatically apply summary statistics
+#' @param data: data.frame that contains the variables
+#' @param var: input variables
+continuous_stats <- function(data, var) {
+  data %>%
+    summarise(
+      variable = quo_name(var),
+      n = sum(!is.na({{ var }})),
+      min = min({{ var }}, na.rm = TRUE),
+      q1 = quantile({{ var }}, probs = 0.25, na.rm = TRUE),
+      median = median({{ var }}, na.rm = TRUE),
+      q3 = quantile({{ var }}, probs = 0.75, na.rm = TRUE),
+      max = max({{ var }}, na.rm = TRUE),
+      mean = mean({{ var }}, na.rm = TRUE),
+      sd = sd({{ var }}, na.rm = TRUE),
+    )
+}
+```
+
+# AL score calculation function
+```{r AL score calc function}
+#' @description Function to take a vector and returns the percentile of a value.
+#' @param x: a vector from a data frame, to generate a empirical cumulative distribution
+#' @param perc: input value for the percentile calculation from the empirical cumulative distribution
+ecdf_fun <- function(x, perc) ecdf(x)(perc)
+# OCT 3, 2023: Summing up percentiles is not mathematically meaningful. I am not using this function.
+
+#' @description Function to automatically apply AL cut-off values
+#' @param data: data.frame that contains the biomarkers
+#' @param scoreno: character that indicates which AL cutoffs should be use (options: 'cut-off score','continuous score')
+#' @param biomarkers: Character vector that includes the biomarkers to serve as colnames
+#' @param biomarker_positivescore: Character vector that includes the biomarkers with positive scoring
+#' @param biomarker_reversescore: Character vector that includes the biomarkers with reverse scoring
+#' @param biomarker_nonlinearscore: Character vector that includes the biomarkers with non-linear scoring
+
+ALscore <- function(data, scoreno, biomarkers, biomarker_positivescore, biomarker_reversescore, biomarker_nonlinearscore) {
+  if ("cut-off score" %in% scoreno) {
+    df_q <- data %>%
+      select(HelixID, e3_sex, all_of(biomarkers)) %>%
+      mutate(
+        across(
+          .cols = all_of(biomarkers),
+          .fns = \(x) ntile(x, n = 4),
+          .names = "{col}_q"
+        )
+      ) %>%
+      select(HelixID, e3_sex, ends_with("_q"))
+
+    # make quartiles
+    # positive scoring
+    biomarker_q <- paste(biomarker_positivescore, "q", sep = "_")
+    df_q <- df_q %>% mutate(
+      across(
+        .cols = all_of(biomarker_q),
+        .fns = \(x) if_else(x == 4, 1, 0, NA),
+        .names = "{col}_as1"
+      )
+    )
+
+    # reverse scoring
+    biomarker_q <- paste(biomarker_reversescore, "q", sep = "_")
+    df_q <- df_q %>% mutate(
+      across(
+        .cols = all_of(biomarker_q),
+        .fns = \(x) if_else(x == 1, 1, 0, NA),
+        .names = "{col}_as1"
+      )
+    )
+
+    # non-linear scoring
+    biomarker_q <- paste(biomarker_nonlinearscore, "q", sep = "_")
+    df_q <- df_q %>% mutate(
+      across(
+        .cols = all_of(biomarker_q),
+        .fns = \(x) if_else(x == 4 | x == 1, 1, 0, NA),
+        .names = "{col}_as1"
+      )
+    )
+
+    # summary score
+    cardio_q <- paste(cardio, "q_as1", sep = "_")
+    metab_q <- paste(metab, "q_as1", sep = "_")
+    immune_q <- paste(immune, "q_as1", sep = "_")
+    neuro_q <- paste(neuro, "q_as1", sep = "_")
+    # formula
+    cardio_sum <- paste(cardio_q, collapse = " + ")
+    metab_sum <- paste(metab_q, collapse = " + ")
+    immune_sum <- paste(immune_q, collapse = " + ")
+    neuro_sum <- paste(neuro_q, collapse = " + ")
+
+    df_q <- df_q %>%
+      mutate(
+        AL_1_cardio = rlang::eval_tidy(rlang::parse_expr(cardio_sum), data = .),
+        AL_1_metab = rlang::eval_tidy(rlang::parse_expr(metab_sum), data = .),
+        AL_1_immune = rlang::eval_tidy(rlang::parse_expr(immune_sum), data = .),
+        AL_1_neuro = rlang::eval_tidy(rlang::parse_expr(neuro_sum), data = .),
+        AL_1_tot = AL_1_cardio + AL_1_metab + AL_1_immune + AL_1_neuro
+      )
+
+    # weighted average score
+    # formula
+    cardio_wgtsum <- paste0("(", paste(cardio_q, collapse = " + "), ")/", length(cardio_q), sep = "")
+    metab_wgtsum <- paste0("(", paste(metab_q, collapse = " + "), ")/", length(metab_q), sep = "")
+    immune_wgtsum <- paste0("(", paste(immune_q, collapse = " + "), ")/", length(immune_q), sep = "")
+    neuro_wgtsum <- paste0("(", paste(neuro_q, collapse = " + "), ")/", length(neuro_q), sep = "")
+
+    df_q <- df_q %>%
+      mutate(
+        AL_1_cardio_wavg = rlang::eval_tidy(rlang::parse_expr(cardio_wgtsum), data = .),
+        AL_1_metab_wavg = rlang::eval_tidy(rlang::parse_expr(metab_wgtsum), data = .),
+        AL_1_immune_wavg = rlang::eval_tidy(rlang::parse_expr(immune_wgtsum), data = .),
+        AL_1_neuro_wavg = rlang::eval_tidy(rlang::parse_expr(neuro_wgtsum), data = .),
+        AL_1_tot_wavg = AL_1_cardio_wavg + AL_1_metab_wavg + AL_1_immune_wavg + AL_1_neuro_wavg
+      )
+
+    # final dataset
+    # df_q <- df_q %>% select(-matches("_q$|_as1$"))
+    # assign different score name to the sex-specific AL score, based on girls and boys separately
+    if (nrow(df_q) < 1301) {
+      df_q <- df_q %>% 
+        rename(
+          AL_2_cardio = AL_1_cardio,
+          AL_2_metab = AL_1_metab,
+          AL_2_immune = AL_1_immune,
+          AL_2_neuro = AL_1_neuro,
+          AL_2_tot = AL_1_tot,
+          AL_2_cardio_wavg = AL_1_cardio_wavg,
+          AL_2_metab_wavg = AL_1_metab_wavg,
+          AL_2_immune_wavg = AL_1_immune_wavg,
+          AL_2_neuro_wavg = AL_1_neuro_wavg,
+          AL_2_tot_wavg = AL_1_tot_wavg
+        )
+    }
+  }
+  if ("continuous score" %in% scoreno) {
+    # positive scoring
+    df_z <- data %>%
+      select(HelixID, e3_sex, all_of(biomarkers)) %>%
+      mutate(
+        across(
+          .cols = all_of(biomarkers),
+          .fns = ~ rescale(.x, to = c(0, 1)), # rescale a variable with min = 0 and max = 1. Linear rescaling will not change the shape of the distribution.
+          .names = "{col}_z"
+        )
+      ) %>%
+      mutate(across(ends_with("_z"), as.numeric)) %>%
+      select(HelixID, e3_sex, ends_with("_z"))
+
+    # reverse scoring
+    biomarker_z <- paste(biomarker_reversescore, "z", sep = "_")
+    df_z <- df_z %>% mutate(
+      across(
+        .cols = all_of(biomarker_z),
+        .fns = \(x) (1 - x),
+        .names = "{col}"
+      )
+    )
+
+    # non-linear scoring
+    biomarker_z <- paste(biomarker_nonlinearscore, "z", sep = "_")
+    df_z <- df_z %>%
+      mutate(
+        across(
+          .cols = all_of(biomarker_z),
+          .fns = \(x) rescale(x, to = c(-1, 1)),
+          .names = "{col}"
+        )
+      ) %>%
+      mutate(
+        across(
+          .cols = all_of(biomarker_z),
+          .fns = \(x) if_else(x < 0, abs(x), ifelse(x >= 0, x, NA)),
+          .names = "{col}"
+        )
+      )
+
+    # summary score
+    cardio_z <- paste(cardio, "z", sep = "_")
+    metab_z <- paste(metab, "z", sep = "_")
+    immune_z <- paste(immune, "z", sep = "_")
+    neuro_z <- paste(neuro, "z", sep = "_")
+    # formula
+    cardio_zsum <- paste(cardio_z, collapse = " + ")
+    metab_zsum <- paste(metab_z, collapse = " + ")
+    immune_zsum <- paste(immune_z, collapse = " + ")
+    neuro_zsum <- paste(neuro_z, collapse = " + ")
+
+    df_z <- df_z %>%
+      mutate(
+        AL_z1_cardio = rlang::eval_tidy(rlang::parse_expr(cardio_zsum), data = .),
+        AL_z1_metab = rlang::eval_tidy(rlang::parse_expr(metab_zsum), data = .),
+        AL_z1_immune = rlang::eval_tidy(rlang::parse_expr(immune_zsum), data = .),
+        AL_z1_neuro = rlang::eval_tidy(rlang::parse_expr(neuro_zsum), data = .),
+        AL_z1_tot = AL_z1_cardio + AL_z1_metab + AL_z1_immune + AL_z1_neuro
+      )
+
+    # weighted average score
+    # formula
+    cardio_wgtzsum <- paste0("(", paste(cardio_z, collapse = " + "), ")/", length(cardio_z), sep = "")
+    metab_wgtzsum <- paste0("(", paste(metab_z, collapse = " + "), ")/", length(metab_z), sep = "")
+    immune_wgtzsum <- paste0("(", paste(immune_z, collapse = " + "), ")/", length(immune_z), sep = "")
+    neuro_wgtzsum <- paste0("(", paste(neuro_z, collapse = " + "), ")/", length(neuro_z), sep = "")
+
+    df_z <- df_z %>%
+      mutate(
+        AL_z1_cardio_wavg = rlang::eval_tidy(rlang::parse_expr(cardio_wgtzsum), data = .),
+        AL_z1_metab_wavg = rlang::eval_tidy(rlang::parse_expr(metab_wgtzsum), data = .),
+        AL_z1_immune_wavg = rlang::eval_tidy(rlang::parse_expr(immune_wgtzsum), data = .),
+        AL_z1_neuro_wavg = rlang::eval_tidy(rlang::parse_expr(neuro_wgtzsum), data = .),
+        AL_z1_tot_wavg = AL_z1_cardio_wavg + AL_z1_metab_wavg + AL_z1_immune_wavg + AL_z1_neuro_wavg
+      )
+
+    # final dataset
+    # df_z <- df_z %>% select(-matches("_z$"))
+    # assign different score name to the AL score based on sub-population (girls and boys separately)
+    if (nrow(df_z) < 1301) {
+      df_z <- df_z %>% 
+        rename(
+          AL_z2_cardio = AL_z1_cardio,
+          AL_z2_metab = AL_z1_metab,
+          AL_z2_immune = AL_z1_immune,
+          AL_z2_neuro = AL_z1_neuro,
+          AL_z2_tot = AL_z1_tot,
+          AL_z2_cardio_wavg = AL_z1_cardio_wavg,
+          AL_z2_metab_wavg = AL_z1_metab_wavg,
+          AL_z2_immune_wavg = AL_z1_immune_wavg,
+          AL_z2_neuro_wavg = AL_z1_neuro_wavg,
+          AL_z2_tot_wavg = AL_z1_tot_wavg
+        )
+    }
+  }
+  if (exists("df_q")) {
+    assign("ALScore_cutoff", df_q, envir = .GlobalEnv)
+  }
+  if (exists("df_z")) {
+    assign("ALScore_z", df_z, envir = .GlobalEnv)
+  }
+}
+```
+
+
+# Cut-off-based AL scores
+Quantiles are created based on the values of biomarkers of total study population. The highest quantile (75%) of other biomarkers are considered 'high risk' and received a score of 1, except for HDL and cortisol. The lowest quantile (25%) of HDL scored 1, and both the lowest quantile and high quantile of cortisol scored 1. 
+
+## Cut-offs based on whole study sample
+```{r allostatic score 1 quantile based, fig.width = 15 , fig.height = 15}
+ALscore(data = df_full, scoreno = "cut-off score", biomarkers = biomarker_all, biomarker_positivescore, biomarker_reversescore, biomarker_nonlinearscore)
+
+df_full_q <- ALScore_cutoff
+
+df_full_q_g <- df_full_q %>% filter(e3_sex == "Girls")
+df_full_q_b <- df_full_q %>% filter(e3_sex == "Boys")
+
+# Total score
+AL_1_desc <- map_dfr(
+  data = df_full_q,
+  .x = quos(AL_1_cardio, AL_1_metab, AL_1_immune, AL_1_neuro, AL_1_tot),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "total")
+
+AL_1_desc_g <- map_dfr(
+  data = df_full_q_g,
+  .x = quos(AL_1_cardio, AL_1_metab, AL_1_immune, AL_1_neuro, AL_1_tot),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "girl")
+
+AL_1_desc_b <- map_dfr(
+  data = df_full_q_b,
+  .x = quos(AL_1_cardio, AL_1_metab, AL_1_immune, AL_1_neuro, AL_1_tot),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "boy")
+
+# missing in the scores
+df_full_q %>%
+  select("AL_1_cardio_wavg", "AL_1_metab_wavg", "AL_1_immune_wavg", "AL_1_neuro_wavg", "AL_1_tot_wavg") %>%
+  summarise_all(~ sum(is.na(.))) %>%
+  kable(caption = "Missing in the scores") %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T)
+
+AL_1_desc_all <- rbind(AL_1_desc, AL_1_desc_g, AL_1_desc_b) %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_1_cardio", "AL_1_metab", "AL_1_immune", "AL_1_neuro", "AL_1_tot"))) %>%
+  arrange(match(variable, c("AL_1_cardio", "AL_1_metab", "AL_1_immune", "AL_1_neuro", "AL_1_tot")), group) %>%
+  select(-`ordered(...)`)
+
+AL_1_desc_all %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score - Traditional quantile cut method",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+# weighted average score
+AL_1_wavg_desc <- map_dfr(
+  data = df_full_q,
+  .x = quos(AL_1_cardio_wavg, AL_1_metab_wavg, AL_1_immune_wavg, AL_1_neuro_wavg, AL_1_tot_wavg),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "total")
+
+AL_1_wavg_desc_g <- map_dfr(
+  data = df_full_q_g,
+  .x = quos(AL_1_cardio_wavg, AL_1_metab_wavg, AL_1_immune_wavg, AL_1_neuro_wavg, AL_1_tot_wavg),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "girl")
+
+AL_1_wavg_desc_b <- map_dfr(
+  data = df_full_q_b,
+  .x = quos(AL_1_cardio_wavg, AL_1_metab_wavg, AL_1_immune_wavg, AL_1_neuro_wavg, AL_1_tot_wavg),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "boy")
+
+AL_1_wavg_desc_all <- rbind(AL_1_wavg_desc, AL_1_wavg_desc_g, AL_1_wavg_desc_b) %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_1_cardio_wavg", "AL_1_metab_wavg", "AL_1_immune_wavg", "AL_1_neuro_wavg", "AL_1_tot_wavg"))) %>%
+  arrange(match(variable, c("AL_1_cardio_wavg", "AL_1_metab_wavg", "AL_1_immune_wavg", "AL_1_neuro_wavg", "AL_1_tot_wavg")), group) %>%
+  select(-`ordered(...)`)
+
+AL_1_wavg_desc_all %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score - Traditional quantile cut method, weighted average",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+# histograms
+AL_1 <- df_full_q %>%
+  select(
+    e3_sex, AL_1_cardio, AL_1_metab, AL_1_immune, AL_1_neuro,
+    AL_1_cardio_wavg, AL_1_metab_wavg, AL_1_immune_wavg, AL_1_neuro_wavg
+  )
+
+AL_1 %>%
+  pivot_longer(cols = 2:ncol(AL_1)) %>%
+  ggplot(aes(x = value, fill = e3_sex)) +
+  geom_histogram(position = "dodge", alpha = 0.5, bins = 5) +
+  facet_wrap(~name, scales = "free_x") +
+  theme(strip.text = element_text(size = 20), axis.text = element_text(size = 20)) +
+  labs(x = "", y = "")
+
+AL_1_tot <- df_full_q %>%
+  select(
+    e3_sex, AL_1_tot, AL_1_tot_wavg
+  )
+
+AL_1_tot %>%
+  pivot_longer(cols = 2:ncol(AL_1_tot)) %>%
+  ggplot(aes(x = value, fill = e3_sex)) +
+  geom_histogram(position = "dodge", alpha = 0.5, bins = 5) +
+  facet_wrap(~name, scales = "free_x") +
+  theme(strip.text = element_text(size = 20), axis.text = element_text(size = 20)) +
+  labs(x = "", y = "")
+```
+
+### Cut-offs based on girls in the study sample
+```{r allostatic score 1 quantile based girls}
+ALscore(data = df_g, scoreno = "cut-off score", biomarkers = biomarker_all, biomarker_positivescore, biomarker_reversescore, biomarker_nonlinearscore)
+
+df_gq <- ALScore_cutoff
+
+AL_2_desc_gq <- map_dfr(
+  data = df_gq,
+  .x = quos(
+    AL_2_cardio, AL_2_metab, AL_2_immune, AL_2_neuro, AL_2_tot,
+    AL_2_cardio_wavg, AL_2_metab_wavg, AL_2_immune_wavg, AL_2_neuro_wavg, AL_2_tot_wavg
+  ),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "girls")
+
+AL_2_desc_gq <- AL_2_desc_gq %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_2_cardio", "AL_2_metab", "AL_2_immune", "AL_2_neuro", "AL_2_tot", "AL_2_cardio_wavg", "AL_2_metab_wavg", "AL_2_immune_wavg", "AL_2_neuro_wavg", "AL_2_tot_wavg"))) %>%
+  arrange(match(variable, c("AL_2_cardio", "AL_2_metab", "AL_2_immune", "AL_2_neuro", "AL_2_tot", "AL_2_cardio_wavg", "AL_2_metab_wavg", "AL_2_immune_wavg", "AL_2_neuro_wavg", "AL_2_tot_wavg"))) %>%
+  select(-`ordered(...)`)
+
+AL_2_desc_gq %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score in girls - Traditional quantile cut method",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+AL_2_gq <- df_gq %>%
+  select(
+    AL_2_cardio, AL_2_metab, AL_2_immune, AL_2_neuro,
+    AL_2_cardio_wavg, AL_2_metab_wavg, AL_2_immune_wavg, AL_2_neuro_wavg
+  )
+
+AL_2_gq %>%
+  pivot_longer(cols = 1:ncol(AL_2_gq)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales = "free_x")
+
+AL_2_gq_tot <- df_gq %>%
+  select(
+    AL_2_tot, AL_2_tot_wavg
+  )
+
+AL_2_gq_tot %>%
+  pivot_longer(cols = 1:ncol(AL_2_gq_tot)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  facet_wrap(~name, scales = "free_x")
+```
+
+### Cut-offs based on boys in the study sample
+```{r allostatic score 1 quantile based boys}
+ALscore(data = df_b, scoreno = "cut-off score", biomarkers = biomarker_all, biomarker_positivescore, biomarker_reversescore, biomarker_nonlinearscore)
+
+df_bq <- ALScore_cutoff
+
+AL_2_desc_bq <- map_dfr(
+  data = df_bq,
+  .x = quos(
+    AL_2_cardio, AL_2_metab, AL_2_immune, AL_2_neuro, AL_2_tot,
+    AL_2_cardio_wavg, AL_2_metab_wavg, AL_2_immune_wavg, AL_2_neuro_wavg, AL_2_tot_wavg
+  ),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "boys")
+
+AL_2_desc_bq <- AL_2_desc_bq %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_2_cardio", "AL_2_metab", "AL_2_immune", "AL_2_neuro", "AL_2_tot", "AL_2_cardio_wavg", "AL_2_metab_wavg", "AL_2_immune_wavg", "AL_2_neuro_wavg", "AL_2_tot_wavg"))) %>%
+  arrange(match(variable, c("AL_2_cardio", "AL_2_metab", "AL_2_immune", "AL_2_neuro", "AL_2_tot", "AL_2_cardio_wavg", "AL_2_metab_wavg", "AL_2_immune_wavg", "AL_2_neuro_wavg", "AL_2_tot_wavg"))) %>%
+  select(-`ordered(...)`)
+
+AL_2_desc_bq %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score in boys - Traditional quantile cut method",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+AL_2_bq <- df_bq %>%
+  select(
+    AL_2_cardio, AL_2_metab, AL_2_immune, AL_2_neuro,
+    AL_2_cardio_wavg, AL_2_metab_wavg, AL_2_immune_wavg, AL_2_neuro_wavg
+  )
+
+AL_2_bq %>%
+  pivot_longer(cols = 1:ncol(AL_2_bq)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales = "free_x")
+
+AL_2_bq_tot <- df_bq %>%
+  select(
+    AL_2_tot, AL_2_tot_wavg
+  )
+
+AL_2_bq_tot %>%
+  pivot_longer(cols = 1:ncol(AL_2_bq_tot)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  facet_wrap(~name, scales = "free_x")
+```
+
+# Z-score-based AL scores
+## Z-score-based on whole study sample
+```{r allostatic score 2 z score, fig.width = 15 , fig.height = 15}
+ALscore(data = df_full, scoreno = "continuous score", biomarkers = biomarker_all, biomarker_positivescore, biomarker_reversescore, biomarker_nonlinearscore)
+
+df_full_z <- ALScore_z
+
+df_full_z_g <- df_full_z %>% filter(e3_sex == "Girls")
+df_full_z_b <- df_full_z %>% filter(e3_sex == "Boys")
+
+# summary score
+AL_z1_desc <- map_dfr(
+  data = df_full_z,
+  .x = quos(AL_z1_cardio, AL_z1_metab, AL_z1_immune, AL_z1_neuro, AL_z1_tot),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "total")
+
+AL_z1_desc_g <- map_dfr(
+  data = df_full_z_g,
+  .x = quos(AL_z1_cardio, AL_z1_metab, AL_z1_immune, AL_z1_neuro, AL_z1_tot),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "girl")
+
+AL_z1_desc_b <- map_dfr(
+  data = df_full_z_b,
+  .x = quos(AL_z1_cardio, AL_z1_metab, AL_z1_immune, AL_z1_neuro, AL_z1_tot),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "boy")
+
+AL_z1_desc_all <- rbind(AL_z1_desc, AL_z1_desc_g, AL_z1_desc_b) %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_z1_cardio", "AL_z1_metab", "AL_z1_immune", "AL_z1_neuro", "AL_z1_tot"))) %>%
+  arrange(match(variable, c("AL_z1_cardio", "AL_z1_metab", "AL_z1_immune", "AL_z1_neuro", "AL_z1_tot")), group) %>%
+  select(-`ordered(...)`)
+
+AL_z1_desc_all %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score - z score",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+# weighted average score
+AL_z1_wavg_desc <- map_dfr(
+  data = df_full_z,
+  .x = quos(AL_z1_cardio_wavg, AL_z1_metab_wavg, AL_z1_immune_wavg, AL_z1_neuro_wavg, AL_z1_tot_wavg),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "total")
+
+AL_z1_wavg_desc_g <- map_dfr(
+  data = df_full_z_g,
+  .x = quos(AL_z1_cardio_wavg, AL_z1_metab_wavg, AL_z1_immune_wavg, AL_z1_neuro_wavg, AL_z1_tot_wavg),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "girl")
+
+AL_z1_wavg_desc_b <- map_dfr(
+  data = df_full_z_b,
+  .x = quos(AL_z1_cardio_wavg, AL_z1_metab_wavg, AL_z1_immune_wavg, AL_z1_neuro_wavg, AL_z1_tot_wavg),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "boy")
+
+AL_z1_wavg_desc_all <- rbind(AL_z1_wavg_desc, AL_z1_wavg_desc_g, AL_z1_wavg_desc_b) %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_z1_cardio_wavg", "AL_z1_metab_wavg", "AL_z1_immune_wavg", "AL_z1_neuro_wavg", "AL_z1_tot_wavg"))) %>%
+  arrange(match(variable, c("AL_z1_cardio_wavg", "AL_z1_metab_wavg", "AL_z1_immune_wavg", "AL_z1_neuro_wavg", "AL_z1_tot_wavg")), group) %>%
+  select(-`ordered(...)`)
+
+AL_z1_wavg_desc_all %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score - z score, weighted average",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+# histograms
+AL_z1 <- df_full_z %>%
+  select(
+    e3_sex, AL_z1_cardio, AL_z1_metab, AL_z1_immune, AL_z1_neuro,
+    AL_z1_cardio_wavg, AL_z1_metab_wavg, AL_z1_immune_wavg, AL_z1_neuro_wavg
+  )
+
+AL_z1 %>%
+  pivot_longer(cols = 2:ncol(AL_z1)) %>%
+  ggplot(aes(x = value, fill = e3_sex)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  facet_wrap(~name, scales = "free_x") +
+  theme(strip.text = element_text(size = 20), axis.text = element_text(size = 20)) +
+  labs(x = "", y = "")
+
+AL_z1_tot <- df_full_z %>%
+  select(
+    e3_sex, AL_z1_tot, AL_z1_tot_wavg
+  )
+
+AL_z1_tot %>%
+  pivot_longer(cols = 2:ncol(AL_z1_tot)) %>%
+  ggplot(aes(x = value, fill = e3_sex)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  facet_wrap(~name, scales = "free_x") +
+  theme(strip.text = element_text(size = 20), axis.text = element_text(size = 20)) +
+  labs(x = "", y = "")
+```
+
+### Z-score-based on girls in the study sample
+```{r allostatic score z quantile based girls}
+ALscore(data = df_g, scoreno = "continuous score", biomarkers = biomarker_all, biomarker_positivescore, biomarker_reversescore, biomarker_nonlinearscore)
+
+df_gz <- ALScore_z
+
+AL_z2_desc_gz <- map_dfr(
+  data = df_gz,
+  .x = quos(
+    AL_z2_cardio, AL_z2_metab, AL_z2_immune, AL_z2_neuro, AL_z2_tot,
+    AL_z2_cardio_wavg, AL_z2_metab_wavg, AL_z2_immune_wavg, AL_z2_neuro_wavg, AL_z2_tot_wavg
+  ),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "girls")
+
+AL_z2_desc_gz <- AL_z2_desc_gz %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_z2_cardio", "AL_z2_metab", "AL_z2_immune", "AL_z2_neuro", "AL_z2_tot", "AL_z2_cardio_wavg", "AL_z2_metab_wavg", "AL_z2_immune_wavg", "AL_z2_neuro_wavg", "AL_z2_tot_wavg"))) %>%
+  arrange(match(variable, c("AL_z2_cardio", "AL_z2_metab", "AL_z2_immune", "AL_z2_neuro", "AL_z2_tot", "AL_z2_cardio_wavg", "AL_z2_metab_wavg", "AL_z2_immune_wavg", "AL_z2_neuro_wavg", "AL_z2_tot_wavg"))) %>%
+  select(-`ordered(...)`)
+
+AL_z2_desc_gz %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score in girls - z score",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+AL_z2_gz <- df_gz %>%
+  select(
+    AL_z2_cardio, AL_z2_metab, AL_z2_immune, AL_z2_neuro,
+    AL_z2_cardio_wavg, AL_z2_metab_wavg, AL_z2_immune_wavg, AL_z2_neuro_wavg
+  )
+
+AL_z2_gz %>%
+  pivot_longer(cols = 1:ncol(AL_z2_gz)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales = "free_x")
+
+AL_z2_gz_tot <- df_gz %>%
+  select(
+    AL_z2_tot, AL_z2_tot_wavg
+  )
+
+AL_z2_gz_tot %>%
+  pivot_longer(cols = 1:ncol(AL_z2_gz_tot)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  facet_wrap(~name, scales = "free_x")
+```
+
+### Z-score-based on boys in the study sample
+```{r allostatic score z quantile based boys}
+ALscore(data = df_b, scoreno = "continuous score", biomarkers = biomarker_all, biomarker_positivescore, biomarker_reversescore, biomarker_nonlinearscore)
+
+df_bz <- ALScore_z
+
+AL_z2_desc_bz <- map_dfr(
+  data = df_bz,
+  .x = quos(
+    AL_z2_cardio, AL_z2_metab, AL_z2_immune, AL_z2_neuro, AL_z2_tot,
+    AL_z2_cardio_wavg, AL_z2_metab_wavg, AL_z2_immune_wavg, AL_z2_neuro_wavg, AL_z2_tot_wavg
+  ),
+  .f = continuous_stats
+) %>%
+  mutate(across(where(is.numeric), round, 2)) %>%
+  mutate(group = "boys")
+
+AL_z2_desc_bz <- AL_z2_desc_bz %>%
+  mutate(ordered(as.factor(variable), levels = c("AL_z2_cardio", "AL_z2_metab", "AL_z2_immune", "AL_z2_neuro", "AL_z2_tot", "AL_z2_cardio_wavg", "AL_z2_metab_wavg", "AL_z2_immune_wavg", "AL_z2_neuro_wavg", "AL_z2_tot_wavg"))) %>%
+  arrange(match(variable, c("AL_z2_cardio", "AL_z2_metab", "AL_z2_immune", "AL_z2_neuro", "AL_z2_tot", "AL_z2_cardio_wavg", "AL_z2_metab_wavg", "AL_z2_immune_wavg", "AL_z2_neuro_wavg", "AL_z2_tot_wavg"))) %>%
+  select(-`ordered(...)`)
+
+AL_z2_desc_bz %>%
+  kable(
+    col.names = c(
+      "Systems",
+      "N",
+      "Min",
+      "Q1",
+      "Median",
+      "Q3",
+      "Max",
+      "Mean",
+      "Std",
+      "Group"
+    ),
+    caption = "Descriptives of allostatic load score in boys - z score",
+    escape = F
+  ) %>%
+  column_spec(8:10, bold = T) %>%
+  kable_styling(bootstrap_options = c("condensed", "responsive"), full_width = F, position = "left", font_size = 14, fixed_thead = T) %>%
+  scroll_box(width = "100%", height = "100%")
+
+AL_z2_bz <- df_bz %>%
+  select(
+    AL_z2_cardio, AL_z2_metab, AL_z2_immune, AL_z2_neuro,
+    AL_z2_cardio_wavg, AL_z2_metab_wavg, AL_z2_immune_wavg, AL_z2_neuro_wavg
+  )
+
+AL_z2_bz %>%
+  pivot_longer(cols = 1:ncol(AL_z2_bz)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~name, scales = "free_x")
+
+AL_z2_bz_tot <- df_bz %>%
+  select(
+    AL_z2_tot, AL_z2_tot_wavg
+  )
+
+AL_z2_bz_tot %>%
+  pivot_longer(cols = 1:ncol(AL_z2_bz_tot)) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(position = "identity", alpha = 0.5) +
+  facet_wrap(~name, scales = "free_x")
+```
+
+
+```{r export final dataset}
+# Merge datasets
+df_indsex_q <- rbind(df_gq, df_bq) %>% select(-e3_sex)
+df_indsex_z <- rbind(df_gz, df_bz) %>% select(-e3_sex)
+
+df_final <- df_indsex_q %>%
+  left_join(df_indsex_z, by = "HelixID") %>%
+  rename_at(
+    vars(ends_with(".x")),
+    ~ str_replace(., "\\..$", "")
+  ) %>%
+  select_at(
+    vars(-ends_with(".y"))
+  )
+
+df_final <- df_final %>%
+  left_join(df_full, by = "HelixID") %>%
+  rename_at(
+    vars(ends_with(".x")),
+    ~ str_replace(., "\\..$", "")
+  ) %>%
+  select_at(
+    vars(-ends_with(".y"))
+  )
+
+df_finalg <- df_final %>% filter(e3_sex == "Girls")
+df_finalb <- df_final %>% filter(e3_sex == "Boys")
+
+save(df_final, df_finalg, df_finalb, file = "/Users/ymou/helix_project/data/analysis_data/df_al_final.RData")
+```
+
+```{r output, include=FALSE, eval = F}
+# convert rmd to r file
+knitr::purl("2_allostatic_score.Rmd", documentation = 1L)
+```
